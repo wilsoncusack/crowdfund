@@ -3,7 +3,7 @@ pragma solidity 0.6.8;
 pragma experimental ABIEncoderV2;
 
 import {Address} from "@openzeppelin/contracts/utils/Address.sol";
-import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import {
     ReentrancyGuard
 } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -21,9 +21,18 @@ import {IERC721TokenReceiver} from "./interfaces/IERC721TokenReceiver.sol";
  * Crowdfund the creation of NFTs by issuing ERC20 tokens that
  * can be redeemed for the underlying value of the NFT once sold.
  */
-contract CrowdfundV2 is ERC20, ReentrancyGuard, IERC721TokenReceiver {
+contract CrowdfundV2 is ERC721, ReentrancyGuard, IERC721TokenReceiver {
     using SafeMath for uint256;
     using Address for address payable;
+
+    // ============ Structs ============
+    // Stores values used to compute how much 
+    // an NFT holder is entitled to
+    struct TokenSharesInfo {
+        uint256 shareValueOnJoin;
+        uint256 valueWithdrawn;
+        uint256 shares;
+    } 
 
     // ============ Enums ============
 
@@ -59,6 +68,17 @@ contract CrowdfundV2 is ERC20, ReentrancyGuard, IERC721TokenReceiver {
 
     // Represents the current state of the campaign.
     Status public status;
+    // tracks mapping from backer ERC721 tokens to TokenSharesInfo
+    mapping(uint256 => TokenSharesInfo) private _tokenSharesInfo;
+    // tracks backer numbers
+    uint256 private _nonce;
+    // tracks the notional value which one share is entitled to
+    // assuming the share holder never withdraws any value to which 
+    // they are entitled
+    uint256 private _shareValue;
+    // total shares = address.balance * SCALING FACTOR, tracked statically for efficiency
+    uint256 private _totalShares;
+
 
     // ============ Events ============
 
@@ -89,7 +109,7 @@ contract CrowdfundV2 is ERC20, ReentrancyGuard, IERC721TokenReceiver {
         address WETH_,
         uint256 fundingCap_,
         uint256 operatorPercent_
-    ) public ERC20(name_, symbol_) {
+    ) public ERC721(name_, symbol_) {
         // Null checks.
         require(operator_ != address(0), "Operator is null");
         require(operatorPercent_ < 100, "Operator percent >= 100");
@@ -127,9 +147,7 @@ contract CrowdfundV2 is ERC20, ReentrancyGuard, IERC721TokenReceiver {
         // This first case is the happy path, so we will keep it efficient.
         // The balance, which includes the current contribution, is less than or equal to cap.
         if (address(this).balance <= fundingCap) {
-            // Mint equity for the contributor.
-            _mint(backer, valueToTokens(amount));
-            emit Contribution(backer, amount);
+            processContribution(backer, amount);
         } else {
             // Compute the balance of the crowdfund before the contribution was made.
             uint256 startAmount = address(this).balance.sub(amount);
@@ -142,31 +160,78 @@ contract CrowdfundV2 is ERC20, ReentrancyGuard, IERC721TokenReceiver {
             // take what we can until the funding cap is reached, and refund the rest.
             uint256 eligibleAmount = fundingCap.sub(startAmount);
             // Otherwise, we process the contribution as if it were the minimal amount.
-            _mint(backer, valueToTokens(eligibleAmount));
-            emit Contribution(backer, eligibleAmount);
+            processContribution(backer, eligibleAmount);
             // Refund the sender with their contribution (e.g. 2.5 minus the diff - e.g. 1.5 = 1 ETH)
             backer.sendValue(amount.sub(eligibleAmount));
         }
     }
 
     /**
+     * @notice Mints an NFT to the backers and sets the TokenSharesInfo
+     * @dev Emits the Contribution event.
+     */ 
+    function processContribution(address backer, uint256 amount) private {
+        uint256 token = ++_nonce;
+        _safeMint(backer, token, "");
+        uint256 shares = valueToTokens(amount);
+        _totalShares = _totalShares + shares;
+        _tokenSharesInfo[token] = TokenSharesInfo({
+            shareValueOnJoin: _shareValue, 
+            valueWithdrawn: 0,
+            shares: shares,
+            });
+        updateShareValue(); // update now that shareValueOnJoin has been stored
+        emit Contribution(backer, eligibleAmount);
+    }
+
+    /**
+     * @notice Updates share to ETH conversion value
+     */
+    function updateShareValue() private {
+        _shareValue = address(this).balance
+            .div(_totalShares)
+            .sub(1)
+            .div(SCALING_FACTOR)
+            .add(1);
+    }
+
+    /**
+     * @notice Returns the amount of underlying ETH the token is entitled
+     to, scaled
+     */
+    function underlyingBalanceOf(uint256 tokenId) public view returns (uint256){
+        _tokenSharesInfo[tokenId].shares
+            .mul(_shareValue)
+            .sub(_tokenSharesInfo[tokenId].valueWithdrawn);
+    }
+
+    /**
      * @notice Burns the sender's tokens and redeems underlying ETH.
      * @dev Emits the Redeemed event.
      */
-    function redeem(uint256 tokenAmount) external nonReentrant {
+    function redeem(uint256 backerToken, uint256 tokenAmount) external nonReentrant {
         // Prevent backers from accidently redeeming when balance is 0.
         require(
             address(this).balance > 0,
             "Crowdfund: No ETH available to redeem"
         );
+        // check sender owns backerToken
+        require(
+            ownerOf(backerToken) == msg.sender, 
+            "Crowdfund: Only token owner can redeem"
+        )
+        // update the share value, incase the contract
+        // has unexpectly received ETH
+        updateShareValue();
         // Check
         require(
-            balanceOf(msg.sender) >= tokenAmount,
+            underlyingBalanceOf(backerToken) >= tokenAmount,
             "Crowdfund: Insufficient balance"
         );
         // Effect
         uint256 redeemable = redeemableFromTokens(tokenAmount);
-        _burn(msg.sender, tokenAmount);
+        // debit backerToken
+        _tokenSharesInfo[backerToken].valueWithdrawn = _tokenSharesInfo[backerToken].valueWithdrawn + tokenAmount;
         // Safe version of transfer.
         msg.sender.sendValue(redeemable);
         emit Redeemed(msg.sender, redeemable);
@@ -213,9 +278,17 @@ contract CrowdfundV2 is ERC20, ReentrancyGuard, IERC721TokenReceiver {
         // Close funding status, move to tradable.
         status = Status.TRADING;
         // Mint the operator a percent of the total supply.
-        uint256 operatorTokens =
-            (operatorPercent * totalSupply()) / (100 - operatorPercent);
-        _mint(operator, operatorTokens);
+        uint256 token = ++_nonce;
+        _safeMint(operator, token, "");
+        uint256 shares = (operatorPercent * totalSupply()) / (100 - operatorPercent);
+        _totalShares = _totalShares + shares;
+        updateShareValue(); // share value will be diluted
+        _tokenSharesInfo[token] = TokenSharesInfo({
+            shareValueOnJoin: _shareValue, 
+            valueWithdrawn: 0,
+            shares: shares,
+            });
+        updateShareValue();
         // Announce that funding has been closed.
         emit FundingClosed(address(this).balance, operatorTokens);
         // Transfer all funds to the operator.
@@ -245,6 +318,8 @@ contract CrowdfundV2 is ERC20, ReentrancyGuard, IERC721TokenReceiver {
         IMedia(mediaAddress).acceptBid(tokenId, bid);
         // Accepting the bid will transfer WETH into this contract.
         unwrapWETH(bid.amount);
+        // update share value
+        updateShareValue();
         // Annouce that the bid has been accepted, with the given amount.
         emit BidAccepted(bid.amount);
     }
@@ -301,5 +376,10 @@ contract CrowdfundV2 is ERC20, ReentrancyGuard, IERC721TokenReceiver {
     ) external override returns (bytes4) {
         emit ReceivedERC721(_tokenId, msg.sender);
         return ERC721_RECEIVED_RETURN;
+    }
+
+    function _baseURI() internal pure override returns (string memory) {
+        // TODO: give backers a fun image with their backer number!
+        return "http"
     }
 }
