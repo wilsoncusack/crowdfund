@@ -285,7 +285,6 @@ contract CrowdfundV2 is ERC721, ReentrancyGuard, IERC721TokenReceiver {
             valueWithdrawn: 0,
             shares: shares,
             });
-        updateShareValue();
         // Announce that funding has been closed.
         emit FundingClosed(address(this).balance, operatorTokens);
         // Transfer all funds to the operator.
