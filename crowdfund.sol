@@ -220,9 +220,6 @@ contract CrowdfundV2 is ERC721, ReentrancyGuard, IERC721TokenReceiver {
             ownerOf(backerToken) == msg.sender, 
             "Crowdfund: Only token owner can redeem"
         )
-        // update the share value, incase the contract
-        // has unexpectly received ETH
-        updateShareValue();
         // Check
         require(
             underlyingBalanceOf(backerToken) >= tokenAmount,
@@ -319,7 +316,14 @@ contract CrowdfundV2 is ERC721, ReentrancyGuard, IERC721TokenReceiver {
         // Accepting the bid will transfer WETH into this contract.
         unwrapWETH(bid.amount);
         // update share value
-        updateShareValue();
+        _shareValue = _shareValue
+            .add(
+                bid.amount
+                    .div(_totalShares)
+                    .sub(1)
+                    .div(SCALING_FACTOR)
+                    .add(1);
+                );
         // Annouce that the bid has been accepted, with the given amount.
         emit BidAccepted(bid.amount);
     }
