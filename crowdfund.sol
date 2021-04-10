@@ -201,7 +201,7 @@ contract CrowdfundV2 is ERC721, ReentrancyGuard, IERC721TokenReceiver {
      */
     function underlyingBalanceOf(uint256 tokenId) public view returns (uint256){
         _tokenSharesInfo[tokenId].shares
-            .mul(_shareValue)
+            .mul(_shareValue.sub(_tokenSharesInfo[tokenId].shareValueOnJoin))
             .sub(_tokenSharesInfo[tokenId].valueWithdrawn);
     }
 
@@ -278,13 +278,15 @@ contract CrowdfundV2 is ERC721, ReentrancyGuard, IERC721TokenReceiver {
         uint256 token = ++_nonce;
         _safeMint(operator, token, "");
         uint256 shares = (operatorPercent * totalSupply()) / (100 - operatorPercent);
-        _totalShares = _totalShares + shares;
-        updateShareValue(); // share value will be diluted
+        // calculate how much we will have to dilute each share value to give owner take
+        uint256 diluationPerShare = tokensToValue(shares).div(_totalShares);
         _tokenSharesInfo[token] = TokenSharesInfo({
-            shareValueOnJoin: _shareValue, 
+            shareValueOnJoin: _shareValue.sub(diluationPerShare), 
             valueWithdrawn: 0,
             shares: shares,
             });
+        _totalShares = _totalShares + shares;
+        updateShareValue();
         // Announce that funding has been closed.
         emit FundingClosed(address(this).balance, operatorTokens);
         // Transfer all funds to the operator.
